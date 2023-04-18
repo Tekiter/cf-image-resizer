@@ -1,7 +1,7 @@
 use std::{collections::HashMap, io::Cursor};
 
 use futures::stream::StreamExt;
-use image::{imageops::FilterType, io::Reader as ImageReader, ImageOutputFormat};
+use image::{imageops::FilterType, io::Reader as ImageReader, DynamicImage, ImageOutputFormat};
 use serde_json::json;
 use worker::*;
 mod utils;
@@ -32,7 +32,7 @@ pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Respo
     // functionality and a `RouteContext` which you can use to  and get route parameters and
     // Environment bindings like KV Stores, Durable Objects, Secrets, and Variables.
     router
-        .get("/", |_, _| Response::ok("Hello from Workers!"))
+        .get("/", |_, _| Response::ok("Hello Image Resizer!"))
         .post_async("/form/:field", |mut req, ctx| async move {
             if let Some(name) = ctx.param("field") {
                 let form = req.form_data().await?;
@@ -53,32 +53,29 @@ pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Respo
             let version = ctx.var("WORKERS_RS_VERSION")?.to_string();
             Response::ok(version)
         })
-        .get_async("/image", |mut req, ctx| async move {
+        .get_async("/image", |req, _ctx| async move {
             let url = req.url().unwrap();
             let query: HashMap<_, _> = url.query_pairs().collect();
 
-            let url = query.get("url").expect("url 가져오기 실패");
-            let w = query.get("w").expect("no w").parse::<u32>().unwrap();
+            let parsed_url = match query.get("url") {
+                Some(href) => href,
+                None => return Response::error("'url' parameter is not provided.", 403),
+            };
 
-            let fetcher = Fetch::Url(Url::parse(url).expect("url 파스 실패"));
+            let w = match query.get("w") {
+                Some(res) => res.parse::<u32>().unwrap(),
+                None => return Response::error("'w' parameter not provided.", 403),
+            };
 
-            let mut res = fetcher.send().await.expect("이미지 가져오기 실패");
-            let buffer = res.stream().expect("스트림 가져오기 실패");
-            let bytes = buffer
-                .map(|entry| entry.expect("buffer map 실패"))
-                .concat()
-                .await;
+            let bytes = match fetch_image_from_url(parsed_url).await {
+                Ok(bytes) => bytes,
+                Err(_) => return Response::error("failed to fetch image.", 403),
+            };
 
-            let reader = ImageReader::new(Cursor::new(bytes))
-                .with_guessed_format()
-                .expect("This will never fail using Cursor");
-
-            let img = reader.decode().expect("should decoded");
-
-            let resized = img.resize(w, w, FilterType::Nearest);
+            let img = read_image(bytes);
+            let resized = img.resize(w, img.height(), FilterType::Nearest);
 
             let outbuf = vec![];
-
             let mut c = Cursor::new(outbuf);
             resized
                 .write_to(&mut c, ImageOutputFormat::Png)
@@ -96,4 +93,35 @@ pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Respo
         })
         .run(req, env)
         .await
+}
+
+fn read_image(bytes: Vec<u8>) -> DynamicImage {
+    let reader = ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .expect("This will never fail using Cursor");
+
+    let img = reader.decode().expect("should decoded");
+
+    img
+}
+
+async fn fetch_image_from_url(url: &str) -> std::result::Result<Vec<u8>, ImageFetchError> {
+    let url = Url::parse(url).map_err(|_| ImageFetchError::InvalidUrl)?;
+
+    let fetcher = Fetch::Url(url);
+    let mut res = fetcher
+        .send()
+        .await
+        .map_err(|_| ImageFetchError::FailedToFetch)?;
+
+    let buffer = res.stream().map_err(|_| ImageFetchError::FailedToFetch)?;
+
+    let bytes = buffer.map(|entry| entry.unwrap_or(vec![])).concat().await;
+
+    Ok(bytes)
+}
+
+enum ImageFetchError {
+    InvalidUrl,
+    FailedToFetch,
 }
