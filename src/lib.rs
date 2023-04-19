@@ -2,7 +2,6 @@ use std::collections::HashMap;
 
 use image::imageops::FilterType;
 use image_util::{read_image, write_image};
-use serde_json::json;
 use worker::*;
 mod fetcher;
 mod image_util;
@@ -33,22 +32,6 @@ pub async fn main(req: Request, env: Env, worker_ctx: worker::Context) -> Result
 
     router
         .get("/", |_, _| Response::ok("Hello Image Resizer!"))
-        .post_async("/form/:field", |mut req, ctx| async move {
-            if let Some(name) = ctx.param("field") {
-                let form = req.form_data().await?;
-                match form.get(name) {
-                    Some(FormEntry::Field(value)) => {
-                        return Response::from_json(&json!({ name: value }))
-                    }
-                    Some(FormEntry::File(_)) => {
-                        return Response::error("`field` param in form shouldn't be a File", 422);
-                    }
-                    None => return Response::error("Bad Request", 400),
-                }
-            }
-
-            Response::error("Bad Request", 400)
-        })
         .get("/worker-version", |_, ctx| {
             let version = ctx.var("WORKERS_RS_VERSION")?.to_string();
             Response::ok(version)
@@ -69,10 +52,8 @@ pub async fn main(req: Request, env: Env, worker_ctx: worker::Context) -> Result
 
             let cache = Cache::open("cache:image_proxy".to_string()).await;
 
-            if let Ok(response) = cache.get(&req, false).await {
-                if let Some(res) = response {
-                    return Ok(res);
-                }
+            if let Ok(Some(response)) = cache.get(&req, false).await {
+                return Ok(response);
             }
 
             let bytes = match fetcher::fetch_image_from_url(target_url).await {
