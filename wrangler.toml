@@ -1,4 +1,4 @@
-name = "" # todo
+name = "cf-image-resizer"
 main = "build/worker/shim.mjs"
 compatibility_date = "2022-01-20"
 
