@@ -16,21 +16,21 @@ fn log_request(req: &Request) {
     );
 }
 
+struct RouterContext {
+    pub worker_context: Context,
+}
+
 #[event(fetch)]
-pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Response> {
+pub async fn main(req: Request, env: Env, worker_ctx: worker::Context) -> Result<Response> {
     log_request(&req);
 
     // Optionally, get more helpful error messages written to the console in the case of a panic.
     utils::set_panic_hook();
 
-    // Optionally, use the Router to handle matching endpoints, use ":name" placeholders, or "*name"
-    // catch-alls to match on specific patterns. Alternatively, use `Router::with_data(D)` to
-    // provide arbitrary data that will be accessible in each route via the `ctx.data()` method.
-    let router = Router::new();
+    let router = Router::with_data(RouterContext {
+        worker_context: worker_ctx,
+    });
 
-    // Add as many routes as your Worker needs! Each route will get a `Request` for handling HTTP
-    // functionality and a `RouteContext` which you can use to  and get route parameters and
-    // Environment bindings like KV Stores, Durable Objects, Secrets, and Variables.
     router
         .get("/", |_, _| Response::ok("Hello Image Resizer!"))
         .post_async("/form/:field", |mut req, ctx| async move {
@@ -53,12 +53,12 @@ pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Respo
             let version = ctx.var("WORKERS_RS_VERSION")?.to_string();
             Response::ok(version)
         })
-        .get_async("/image", |req, _ctx| async move {
+        .get_async("/image", |req, ctx| async move {
             let url = req.url().unwrap();
             let query: HashMap<_, _> = url.query_pairs().collect();
 
-            let parsed_url = match query.get("url") {
-                Some(href) => href,
+            let target_url = match query.get("url") {
+                Some(target_url) => target_url,
                 None => return Response::error("'url' parameter is not provided.", 403),
             };
 
@@ -67,7 +67,15 @@ pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Respo
                 None => return Response::error("'w' parameter not provided.", 403),
             };
 
-            let bytes = match fetch_image_from_url(parsed_url).await {
+            let cache = Cache::open("cache:image_proxy".to_string()).await;
+
+            if let Ok(response) = cache.get(&req, false).await {
+                if let Some(res) = response {
+                    return Ok(res);
+                }
+            }
+
+            let bytes = match fetch_image_from_url(target_url).await {
                 Ok(bytes) => bytes,
                 Err(_) => return Response::error("failed to fetch image.", 403),
             };
@@ -89,7 +97,18 @@ pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Respo
             header
                 .append("Content-Length", x.len().to_string().as_ref())
                 .unwrap();
-            Ok(Response::from_bytes(x)?.with_headers(header))
+            header
+                .append("Cache-Control", "public, s-maxage=2592000")
+                .unwrap();
+
+            let mut response = Response::from_bytes(x)?.with_headers(header);
+            let cloned: Response = response.cloned()?;
+
+            ctx.data.worker_context.wait_until(async move {
+                let _ = cache.put(&req, cloned).await;
+            });
+
+            Ok(response)
         })
         .run(req, env)
         .await
